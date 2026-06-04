@@ -1,0 +1,23 @@
+# secrets / sessions
+.env
+.env.*
+!.env.example
+storage_state.json
+*.local
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node / next
+node_modules/
+.next/
+dist/
+.vercel
+npm-debug.log*
+yarn-error.log*
+
+# os
+.DS_Store
