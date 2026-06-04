@@ -29,6 +29,7 @@ RFQS_URL = (
 )
 STORAGE_STATE = "storage_state.json"
 PER_PAGE = 100
+MAX_PAGES = 50  # safety cap for the count-unknown fallback walk
 
 
 def log(msg):
@@ -38,9 +39,15 @@ def log(msg):
 # --- pagination helpers (from the verified portal spec) ---------------------
 
 def total_count(page):
-    txt = page.inner_text("#paginationId")
-    m = re.search(r"(\d+)\s*(?:out of|/)\s*(\d+)", txt)
-    return int(m.group(2)) if m else None
+    """Return (total, raw_text). total is None if the count can't be parsed."""
+    try:
+        txt = page.inner_text("#paginationId")
+    except Exception:
+        return None, None
+    norm = re.sub(r"\s+", " ", txt).strip()  # \s also collapses non-breaking spaces
+    m = re.search(r"(\d[\d,]*)\s*(?:out of|of|/|-)\s*(\d[\d,]*)", norm, re.IGNORECASE)
+    total = int(m.group(2).replace(",", "")) if m else None
+    return total, norm
 
 
 def go_next(page):
@@ -82,23 +89,37 @@ def scrape_list(page, url, parser, label):
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_selector("tbody.async-list-tbody tr", timeout=30000)
 
-    total = total_count(page)
-    if total is None:
-        log(f"{label}: WARNING could not read total count — scraping page 1 only")
-        pages = 1
-    else:
+    table = page.locator("table.list-table:has(tbody.async-list-tbody)").first
+    total, raw = total_count(page)
+    log(f"{label}: pagination text = {raw!r}")
+
+    rows = []
+    if total is not None:
         pages = max(1, math.ceil(total / PER_PAGE))
         log(f"{label}: total={total}, pages={pages}")
-
-    table = page.locator("table.list-table:has(tbody.async-list-tbody)").first
-    rows = []
-    for i in range(pages):
-        html = table.evaluate("e => e.outerHTML")
-        page_rows = parser(html)
-        rows.extend(page_rows)
-        log(f"{label}: page {i + 1}/{pages} parsed {len(page_rows)} rows")
-        if i < pages - 1:
-            go_next(page)
+        for i in range(pages):
+            page_rows = parser(table.evaluate("e => e.outerHTML"))
+            rows.extend(page_rows)
+            log(f"{label}: page {i + 1}/{pages} parsed {len(page_rows)} rows")
+            if i < pages - 1:
+                go_next(page)
+    else:
+        # Count unreadable: walk pages until one is short or the next arrow stops
+        # advancing. A page with fewer than PER_PAGE rows is the last page.
+        log(f"{label}: total unknown — walking pages until exhausted")
+        for page_no in range(1, MAX_PAGES + 1):
+            page_rows = parser(table.evaluate("e => e.outerHTML"))
+            rows.extend(page_rows)
+            log(f"{label}: page {page_no} parsed {len(page_rows)} rows")
+            if len(page_rows) < PER_PAGE:
+                break
+            if page.locator("#paginationId path[d^='M17.7,8']").count() == 0:
+                break
+            try:
+                go_next(page)
+            except Exception:
+                log(f"{label}: next did not advance — stopping at page {page_no}")
+                break
 
     log(f"{label}: collected {len(rows)} rows total")
     return rows
@@ -129,14 +150,17 @@ def existing_keys(client, source):
 
 def upsert_rows(client, rows):
     """Upsert on (source, ext_id). Returns (new, updated) counts per the prior state."""
+    # Dedupe within each source by ext_id; a single upsert batch must not contain
+    # the same conflict key twice (Postgres: "cannot affect row a second time").
     by_source = {}
     for r in rows:
-        by_source.setdefault(r["source"], []).append(r)
+        by_source.setdefault(r["source"], {})[r["ext_id"]] = r
 
     new_total = updated_total = 0
-    for source, src_rows in by_source.items():
+    for source, mapping in by_source.items():
+        src_rows = list(mapping.values())
         before = existing_keys(client, source)
-        new = sum(1 for r in src_rows if r["ext_id"] not in before)
+        new = sum(1 for ext_id in mapping if ext_id not in before)
         updated = len(src_rows) - new
         client.table("tenders").upsert(src_rows, on_conflict="source,ext_id").execute()
         log(f"{source}: {len(src_rows)} rows -> {new} new, {updated} updated")
