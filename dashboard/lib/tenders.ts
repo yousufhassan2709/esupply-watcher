@@ -36,6 +36,12 @@ export function isClosingSoon(
 }
 
 export async function fetchTenders(): Promise<Tender[]> {
+  if (!supabase) {
+    throw new Error(
+      "Supabase isn’t configured. Set NEXT_PUBLIC_SUPABASE_URL and " +
+        "NEXT_PUBLIC_SUPABASE_ANON_KEY in the Vercel project, then redeploy."
+    );
+  }
   const { data, error } = await supabase
     .from("tenders")
     .select("*")
