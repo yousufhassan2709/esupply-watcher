@@ -7,13 +7,13 @@ Runs as a Railway cron. Exits non-zero on hard failure so the cron surfaces it.
 """
 import math
 import os
-import re
 import sys
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from supabase import create_client
 
+from pagination import parse_total
 from parsers import parse_opportunities, parse_rfqs, normalise
 
 load_dotenv()
@@ -44,10 +44,7 @@ def total_count(page):
         txt = page.inner_text("#paginationId")
     except Exception:
         return None, None
-    norm = re.sub(r"\s+", " ", txt).strip()  # \s also collapses non-breaking spaces
-    m = re.search(r"(\d[\d,]*)\s*(?:out of|of|/|-)\s*(\d[\d,]*)", norm, re.IGNORECASE)
-    total = int(m.group(2).replace(",", "")) if m else None
-    return total, norm
+    return parse_total(txt), (txt or "").strip()
 
 
 def go_next(page):
@@ -93,26 +90,28 @@ def scrape_list(page, url, parser, label):
     total, raw = total_count(page)
     log(f"{label}: pagination text = {raw!r}")
 
-    rows = []
+    # Parse page 1 first so we can learn the *actual* page size. The two lists
+    # use different sizes (opportunities show 100/page, RFQs 10/page), so a
+    # fixed PER_PAGE would mis-count the number of pages and silently drop rows.
+    rows = parser(table.evaluate("e => e.outerHTML"))
+    per_page = len(rows) or PER_PAGE
+    log(f"{label}: page 1 parsed {len(rows)} rows (per_page={per_page})")
+
     if total is not None:
-        pages = max(1, math.ceil(total / PER_PAGE))
+        pages = max(1, math.ceil(total / per_page))
         log(f"{label}: total={total}, pages={pages}")
-        for i in range(pages):
+        for i in range(2, pages + 1):
+            go_next(page)
             page_rows = parser(table.evaluate("e => e.outerHTML"))
             rows.extend(page_rows)
-            log(f"{label}: page {i + 1}/{pages} parsed {len(page_rows)} rows")
-            if i < pages - 1:
-                go_next(page)
+            log(f"{label}: page {i}/{pages} parsed {len(page_rows)} rows")
     else:
-        # Count unreadable: walk pages until one is short or the next arrow stops
-        # advancing. A page with fewer than PER_PAGE rows is the last page.
+        # Count unreadable: walk pages until one comes back short or the next
+        # arrow is gone. A page with fewer than per_page rows is the last page.
         log(f"{label}: total unknown — walking pages until exhausted")
-        for page_no in range(1, MAX_PAGES + 1):
-            page_rows = parser(table.evaluate("e => e.outerHTML"))
-            rows.extend(page_rows)
-            log(f"{label}: page {page_no} parsed {len(page_rows)} rows")
-            if len(page_rows) < PER_PAGE:
-                break
+        last_count = len(rows)
+        page_no = 1
+        while last_count == per_page and page_no < MAX_PAGES:
             if page.locator("#paginationId path[d^='M17.7,8']").count() == 0:
                 break
             try:
@@ -120,6 +119,11 @@ def scrape_list(page, url, parser, label):
             except Exception:
                 log(f"{label}: next did not advance — stopping at page {page_no}")
                 break
+            page_no += 1
+            page_rows = parser(table.evaluate("e => e.outerHTML"))
+            rows.extend(page_rows)
+            last_count = len(page_rows)
+            log(f"{label}: page {page_no} parsed {len(page_rows)} rows")
 
     log(f"{label}: collected {len(rows)} rows total")
     return rows
