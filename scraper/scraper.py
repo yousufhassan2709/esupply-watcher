@@ -47,6 +47,27 @@ def total_count(page):
     return parse_total(txt), (txt or "").strip()
 
 
+SESSION_EXPIRED_MARKERS = (
+    "session is invalid or expired",
+    "\u0627\u0646\u062a\u0647\u062a \u0635\u0644\u0627\u062d\u064a\u0629 \u062c\u0644\u0633\u0629 \u0639\u0645\u0644\u0643",
+)
+
+
+def session_expired(page):
+    """True if the portal served its 'session invalid or expired' interstitial.
+
+    The opportunities list is public, so it renders fine with no session at all.
+    Only the RFQ list actually requires auth — which means a silently failed
+    login looks like a 30s selector timeout on RFQs rather than a login error.
+    Detect the interstitial explicitly so the real cause is in the logs.
+    """
+    try:
+        text = page.inner_text("body").lower()
+    except Exception:
+        return False
+    return any(m.lower() in text for m in SESSION_EXPIRED_MARKERS)
+
+
 def go_next(page):
     arrow = page.locator("#paginationId path[d^='M17.7,8']").last
     btn = arrow.locator(
@@ -75,6 +96,11 @@ def login(page):
     page.fill("#password", password)
     page.click("#Go")
     page.wait_for_load_state("networkidle", timeout=30000)
+    if page.locator("#username").count() and page.locator("#username").is_visible():
+        raise RuntimeError(
+            "login failed — still on the login form after submitting. "
+            "Check ESUPPLY_USERNAME / ESUPPLY_PASSWORD."
+        )
     log("login submitted")
 
 
@@ -84,6 +110,11 @@ def scrape_list(page, url, parser, label):
     """Navigate to a list page, walk all paginated pages, return parsed rows."""
     log(f"{label}: navigating")
     page.goto(url, wait_until="domcontentloaded")
+    if session_expired(page):
+        raise RuntimeError(
+            f"{label}: portal served 'session invalid or expired' — the login did "
+            "not produce a valid session. Check ESUPPLY_USERNAME / ESUPPLY_PASSWORD."
+        )
     page.wait_for_selector("tbody.async-list-tbody tr", timeout=30000)
 
     table = page.locator("table.list-table:has(tbody.async-list-tbody)").first
@@ -211,14 +242,24 @@ def main():
         else:
             login(page)
 
-        opportunities = scrape_list(
-            page, OPPORTUNITIES_URL, parse_opportunities, "opportunities"
-        )
-        rfqs = scrape_list(page, RFQS_URL, parse_rfqs, "rfqs")
+        # Scrape each list independently. A failure in one must not discard the
+        # rows already collected from the other — that is what turned a broken
+        # RFQ page into three months of no writes at all.
+        collected = {"opportunities": [], "rfqs": []}
+        failures = {}
+        for label, url, parser in (
+            ("opportunities", OPPORTUNITIES_URL, parse_opportunities),
+            ("rfqs", RFQS_URL, parse_rfqs),
+        ):
+            try:
+                collected[label] = scrape_list(page, url, parser, label)
+            except Exception as exc:  # noqa: BLE001 — one list must not sink the other
+                failures[label] = f"{type(exc).__name__}: {exc}"
+                log(f"ERROR {label} failed — {failures[label]}")
 
         browser.close()
 
-    rows = normalise(opportunities, rfqs)
+    rows = normalise(collected["opportunities"], collected["rfqs"])
     log(f"normalised {len(rows)} rows "
         f"({sum(1 for r in rows if r['source'] == 'opportunity')} opportunities, "
         f"{sum(1 for r in rows if r['source'] == 'rfq')} rfqs)")
@@ -230,6 +271,13 @@ def main():
     new, updated = upsert_rows(client, rows)
     total = db_total(client)
     log(f"SUMMARY: {len(rows)} scraped, {new} new, {updated} updated, {total} total in DB")
+
+    if failures:
+        # The good rows are committed above; still exit non-zero so the cron
+        # surfaces the partial run instead of reporting a clean success.
+        for label, err in failures.items():
+            log(f"PARTIAL {label} did not scrape: {err}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
